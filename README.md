@@ -1,125 +1,125 @@
 # CocoIndex Codebase Knowledge Graph
 
-Index any codebase into a **Neo4j knowledge graph** with **semantic search**. Uses [CocoIndex](https://github.com/cocoindex-io/cocoindex) to scan, chunk, embed, and extract entities from source code using Claude.
-
-## What it does
-
-Given a path to any repository, this tool:
-
-1. **Scans** all source files (TS, Python, Rust, C/C++, Java, etc.)
-2. **Chunks** code using Tree-sitter (language-aware splitting)
-3. **Embeds** chunks locally with SentenceTransformer (free, no API key)
-4. **Extracts entities & relationships** using Claude via `ExtractByLlm` -- in a single pass, produces:
-   - **Graph data**: entities (functions, components, schemas...) and relationships (imports, calls, depends on...)
-   - **Per-file summaries**: business logic description, dependencies, key architectural decisions
-5. **Exports** to Neo4j (knowledge graph) + Postgres (vector embeddings)
-6. **Enables** visual graph exploration in Neo4j Browser + semantic code search
+Index any codebase into a **Neo4j knowledge graph** with **semantic search**, powered by [CocoIndex](https://github.com/cocoindex-io/cocoindex).
 
 ## Requirements
 
-- **Docker** (for Postgres + Neo4j)
+- **Docker** (Postgres + Neo4j)
 - **Python 3.11+**
-- **`ANTHROPIC_API_KEY`** environment variable
+- **API key** — one of: `ANTHROPIC_API_KEY` (Claude) or `GEMINI_API_KEY` (Gemini)
 
 ## Quick Start
 
 ```bash
-# Clone
-git clone <repo-url>
-cd cocoindex-ring
+git clone https://github.com/abarriel/cocoindex-ring.git && cd cocoindex-ring
 
-# Start infrastructure
+# Infrastructure
 docker compose up -d
 
 # Install
 pip install -e .
 
-# Set your Anthropic API key
-export ANTHROPIC_API_KEY=sk-ant-...
+# Configure
+cp .env.example .env
+export ANTHROPIC_API_KEY=sk-ant-...   # or GEMINI_API_KEY=AIza...
 
 # Index a repository
-export COCOINDEX_REPO_PATH=/path/to/your/repo
-cocoindex update main
+python main.py index -r /path/to/your/repo
 
-# Open the knowledge graph
-open http://localhost:7474
-# Login: neo4j / cocoindex
+# Explore the graph
+open http://localhost:7474   # neo4j / cocoindex
 
 # Semantic search
-python main.py search --repository /path/to/your/repo
+python main.py search -r /path/to/your/repo
 ```
 
-## Infrastructure
+## CLI
+
+```bash
+# Index (default: Claude)
+python main.py index  -r /path/to/repo
+python main.py index  -r /path/to/repo --llm gemini
+
+# Search
+python main.py search -r /path/to/repo
+python main.py search -r /path/to/repo --top-k 10
+```
+
+| Command | Flag | Short | Default | Description |
+|---------|------|-------|---------|-------------|
+| `index` | `--repository` | `-r` | required | Path to the repository |
+| `index` | `--llm` | | `anthropic` | LLM provider: `anthropic` or `gemini` |
+| `search` | `--repository` | `-r` | required | Path to the repository |
+| `search` | `--top-k` | `-k` | `5` | Number of results |
+
+## Configuration
+
+### Environment variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `COCOINDEX_DATABASE_URL` | Yes | Postgres connection (set in `.env`) |
+| `ANTHROPIC_API_KEY` | If `--llm anthropic` | Claude API key |
+| `GEMINI_API_KEY` | If `--llm gemini` | Gemini API key |
+
+### Infrastructure
 
 | Service | Port | Credentials |
 |---------|------|-------------|
 | PostgreSQL 16 (pgvector) | `5433` | `cocoindex` / `cocoindex` |
 | Neo4j 5 | `7474` (browser), `7687` (bolt) | `neo4j` / `cocoindex` |
 
-## Architecture
+### LLM providers
 
-### Two flows, one LLM pass
+| Provider | Model | Cost (~100 files) |
+|----------|-------|--------------------|
+| Anthropic | `claude-sonnet-4-20250514` | ~$1-3 |
+| Gemini | `gemini-2.0-flash` | ~$0.10-0.50 |
+
+### Supported languages
+
+TypeScript, JavaScript, Python, Rust, C/C++, Java, Prisma, Markdown
+
+## Examples
+
+### Semantic search
 
 ```
-Repository
-    |
-    v
-+-------------------+     +------------------------+
-| Flow: CodeEmbedding|     | Flow: KnowledgeGraph   |
-|                   |     |                        |
-| LocalFile source  |     | LocalFile source       |
-|       |           |     |       |                |
-| SplitRecursively  |     | ExtractByLlm (Claude)  |
-|       |           |     |   -> FileAnalysis       |
-| SentenceTransformer|    |   -> summary            |
-|       |           |     |   -> entities[]         |
-| Export: Postgres   |     |   -> relationships[]    |
-| (vector index)    |     |       |                |
-+-------------------+     | Export: Neo4j           |
-                          | (nodes + edges)         |
-                          +------------------------+
+$ python main.py search -r ~/my-project
+
+Searching in: /Users/you/my-project
+Returning top 5 results
+Type a query, or press Enter to quit.
+
+query> how does authentication work?
+  [0.410] src/router.ts (L12-L45)
+    Session token generation, cookie handling, refresh logic...
+
+query> database schema
+  [0.390] prisma/schema.prisma (L1-L80)
+    User, Ring, Swipe, Couple, Match models...
+
+query> push notifications
+  [0.370] src/router.ts (L120-L155)
+    Expo push notification on match detection...
+
+query> swipe deck UI
+  [0.350] src/components/swipe-deck.tsx (L1-L90)
+    Swipeable card component with gesture handling...
 ```
 
-### What Claude extracts per file
-
-```python
-@dataclass
-class FileAnalysis:
-    summary: str                     # Business logic, data flow, key decisions
-    entities: list[Entity]           # Functions, components, classes, schemas...
-    relationships: list[Relationship] # IMPORTS, CALLS, DEPENDS_ON, EXTENDS...
-```
-
-### Graph structure
-
-- **File nodes** -- each source file with a `summary` property
-- **Entity nodes** -- functions, components, classes, schemas, models, routes
-- **DEFINES edges** -- File -> Entity
-- **RELATED_TO edges** -- Entity -> Entity (imports, calls, depends on)
-
-## Usage
-
-### Index a repository
-
-```bash
-export COCOINDEX_REPO_PATH=/path/to/repo
-cocoindex update main
-```
-
-On first run, CocoIndex creates the database tables and Neo4j constraints. Subsequent runs only process changed files (incremental).
-
-### Explore the graph (Neo4j Browser)
+### Neo4j queries
 
 Open `http://localhost:7474`, login with `neo4j` / `cocoindex`.
 
 ```cypher
--- Full graph (limit for performance)
+-- Full graph
 MATCH p=()-->() RETURN p LIMIT 200
 
 -- File summaries
 MATCH (f:File) RETURN f.filename, f.summary
 
--- What does a specific file define?
+-- What does a file define?
 MATCH (f:File {filename: "src/router.ts"})-[:DEFINES]->(e)
 RETURN e.value
 
@@ -133,67 +133,9 @@ MATCH (e:Entity) WHERE e.value CONTAINS "auth"
 RETURN e.value
 ```
 
-### Semantic search
-
-```bash
-python main.py search --repository /path/to/repo
-python main.py search --repository /path/to/repo --top-k 10
-```
-
-Search uses cosine similarity on the embedded code chunks. Type natural language queries like:
-- "how does authentication work?"
-- "database schema relationships"
-- "push notifications"
-
-### CocoInsight (pipeline visualization)
-
-```bash
-export COCOINDEX_REPO_PATH=/path/to/repo
-cocoindex server -ci main
-# Open https://cocoindex.io/cocoinsight
-```
-
-## Supported languages
-
-| Language | Extensions |
-|----------|-----------|
-| TypeScript / JavaScript | `.ts` `.tsx` `.js` `.jsx` |
-| Python | `.py` |
-| Rust | `.rs` |
-| C / C++ | `.c` `.h` `.cpp` `.hpp` `.cc` `.hh` `.cxx` `.hxx` |
-| Java | `.java` |
-| Prisma | `.prisma` |
-| Markdown | `.md` `.mdx` |
-
-## Configuration
-
-### Environment variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `COCOINDEX_REPO_PATH` | Yes | Path to the repository to index |
-| `COCOINDEX_DATABASE_URL` | Yes | Postgres connection string (set in `.env`) |
-| `ANTHROPIC_API_KEY` | Yes | For entity extraction via Claude |
-| `PYTORCH_ENABLE_MPS_FALLBACK` | No | Set to `1` on Mac for MPS compatibility |
-
-### Excluded patterns
-
-Build artifacts, lock files, and generated code are automatically excluded:
-
-```
-node_modules/, dist/, build/, .next/, .turbo/, __pycache__/,
-target/, .gradle/, *.class, *.o, *.so, pnpm-lock.yaml, etc.
-```
-
-## Cost
-
-- **Embeddings**: Free (local SentenceTransformer model)
-- **Entity extraction**: ~$0.50-$3.00 per run depending on codebase size
-- **Incremental updates**: Only changed files are re-processed
-
 ## Teardown
 
 ```bash
-docker compose down        # Stop containers (data preserved in volumes)
-docker compose down -v     # Stop containers and delete all data
+docker compose down        # Stop (data preserved)
+docker compose down -v     # Stop and wipe all data
 ```

@@ -22,25 +22,26 @@ docker compose up -d
 pip install -e .
 
 export ANTHROPIC_API_KEY=sk-ant-...
-export COCOINDEX_REPO_PATH=~/_/ring
-cocoindex update main
+
+# Index with Claude (default)
+python main.py index --repository ~/_/ring
+
+# Or with Gemini (cheaper)
+# export GEMINI_API_KEY=AIza...
+# python main.py index --repository ~/_/ring --llm gemini
 ```
 
 ### Output
 
 ```
-[ TO CREATE ] Flow: CodeEmbedding
-    [ TO CREATE ] Postgres table CodeEmbedding__code_embeddings
-[ TO CREATE ] Flow: KnowledgeGraph
-    [ TO CREATE ] Neo4j Node(label:File)
-    [ TO CREATE ] Neo4j Node(label:Entity)
-    [ TO CREATE ] Neo4j Relationship(type:RELATED_TO)
-    [ TO CREATE ] Neo4j Relationship(type:DEFINES)
+Repository:  /Users/you/_/ring
+LLM:         claude-sonnet-4-20250514 (anthropic)
 
-Changes need to be pushed. Continue? [yes/N]: yes
+Setting up backends...
+CodeEmbedding: ...
+KnowledgeGraph: ...
 
-CodeEmbedding.files (batch update): 98/98 source rows: 98 added [elapsed: 5.7s]
-KnowledgeGraph.files (batch update): 98/98 source rows: 92 added, 6 errors [elapsed: 55.4s]
+Done! Open http://localhost:7474 to explore the graph.
 ```
 
 ### Results
@@ -147,7 +148,9 @@ RETURN e.value
 ## Step 3: Semantic search
 
 ```bash
-python main.py search --repository ~/_/ring
+python main.py search -r ~/_/ring
+# or with more results:
+python main.py search -r ~/_/ring --top-k 10
 ```
 
 ### Query: "how does match detection work?"
@@ -202,8 +205,11 @@ Enter search query: how does match detection work?
 ## Step 4: Index a different repository
 
 ```bash
-export COCOINDEX_REPO_PATH=~/projects/other-project
-cocoindex update main
+# With Claude
+python main.py index -r ~/projects/other-project
+
+# With Gemini (cheaper, faster)
+python main.py index -r ~/projects/other-project --llm gemini
 ```
 
 CocoIndex detects changed files and only re-processes what's new. To index a completely different repo, the previous data is replaced.

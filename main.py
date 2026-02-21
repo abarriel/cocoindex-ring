@@ -4,14 +4,10 @@ CocoIndex Codebase Knowledge Graph
 Index any codebase into a Neo4j knowledge graph with semantic search.
 
 Usage:
-    # Build index
-    cocoindex update main -- --repository /path/to/repo
-
-    # Semantic search
+    python main.py index --repository /path/to/repo
+    python main.py index --repository /path/to/repo --llm gemini
     python main.py search --repository /path/to/repo
-
-    # Start CocoInsight server
-    cocoindex server -ci main
+    python main.py search --repository /path/to/repo --top-k 10
 """
 
 import argparse
@@ -26,6 +22,9 @@ from dotenv import load_dotenv
 from numpy.typing import NDArray
 from pgvector.psycopg import register_vector
 from psycopg_pool import ConnectionPool
+
+# Load .env early
+load_dotenv()
 
 
 # ---------------------------------------------------------------------------
@@ -92,12 +91,27 @@ DEFAULT_EXCLUDED_PATTERNS: list[str] = [
     "**/.DS_Store",
 ]
 
+# LLM provider configurations
+LLM_PROVIDERS = {
+    "anthropic": {
+        "api_type": cocoindex.LlmApiType.ANTHROPIC,
+        "model": "claude-sonnet-4-20250514",
+        "env_key": "ANTHROPIC_API_KEY",
+    },
+    "gemini": {
+        "api_type": cocoindex.LlmApiType.GEMINI,
+        "model": "gemini-2.0-flash",
+        "env_key": "GEMINI_API_KEY",
+    },
+}
+
 
 @dataclass
 class RepoConfig:
     """Configuration for a repository to index."""
 
     path: str
+    llm_provider: str = "anthropic"
     included_patterns: list[str] = field(
         default_factory=lambda: list(DEFAULT_INCLUDED_PATTERNS)
     )
@@ -190,7 +204,6 @@ def code_embedding_flow_def(config: RepoConfig):
     def _flow_def(
         flow_builder: cocoindex.FlowBuilder, data_scope: cocoindex.DataScope
     ) -> None:
-        # Source: scan repository files
         data_scope["files"] = flow_builder.add_source(
             cocoindex.sources.LocalFile(
                 path=config.path,
@@ -202,11 +215,9 @@ def code_embedding_flow_def(config: RepoConfig):
         code_embeddings = data_scope.add_collector()
 
         with data_scope["files"].row() as file:
-            # Detect language for Tree-sitter aware chunking
             file["language"] = file["filename"].transform(
                 cocoindex.functions.DetectProgrammingLanguage()
             )
-            # Split into chunks using Tree-sitter
             file["chunks"] = file["content"].transform(
                 cocoindex.functions.SplitRecursively(),
                 language=file["language"],
@@ -225,7 +236,6 @@ def code_embedding_flow_def(config: RepoConfig):
                     end=chunk["end"],
                 )
 
-        # Export to Postgres with vector index for similarity search
         code_embeddings.export(
             "code_embeddings",
             cocoindex.targets.Postgres(),
@@ -249,10 +259,11 @@ def code_embedding_flow_def(config: RepoConfig):
 def knowledge_graph_flow_def(config: RepoConfig):
     """Create a parameterized flow definition for the knowledge graph."""
 
+    provider = LLM_PROVIDERS[config.llm_provider]
+
     def _flow_def(
         flow_builder: cocoindex.FlowBuilder, data_scope: cocoindex.DataScope
     ) -> None:
-        # Source: scan the same repository files
         data_scope["files"] = flow_builder.add_source(
             cocoindex.sources.LocalFile(
                 path=config.path,
@@ -261,18 +272,16 @@ def knowledge_graph_flow_def(config: RepoConfig):
             )
         )
 
-        # Collectors for graph elements
         file_nodes = data_scope.add_collector()
         entity_relationships = data_scope.add_collector()
         file_entity_mentions = data_scope.add_collector()
 
         with data_scope["files"].row() as file:
-            # Extract entities, relationships, and summary using Claude
             file["analysis"] = file["content"].transform(
                 cocoindex.functions.ExtractByLlm(
                     llm_spec=cocoindex.LlmSpec(
-                        api_type=cocoindex.LlmApiType.ANTHROPIC,
-                        model="claude-sonnet-4-20250514",
+                        api_type=provider["api_type"],
+                        model=provider["model"],
                     ),
                     output_type=FileAnalysis,
                     instruction=(
@@ -283,18 +292,18 @@ def knowledge_graph_flow_def(config: RepoConfig):
                         "routes, types, interfaces, constants, configs).\n"
                         "3. All relationships: what this file imports, exports, depends on, calls, "
                         "extends, or implements.\n"
-                        "For entity descriptions, explain the business purpose, not just 'a function'."
+                        "For entity descriptions, explain the business purpose, not just 'a function'.\n"
+                        "IMPORTANT: Always return non-null arrays for entities and relationships. "
+                        "If none found, return empty arrays []."
                     ),
                 ),
             )
 
-            # Collect file as a node with its summary
             file_nodes.collect(
                 filename=file["filename"],
                 summary=file["analysis"]["summary"],
             )
 
-            # Process each extracted relationship
             with file["analysis"]["relationships"].row() as rel:
                 entity_relationships.collect(
                     id=cocoindex.GeneratedField.UUID,
@@ -303,7 +312,6 @@ def knowledge_graph_flow_def(config: RepoConfig):
                     object=rel["object"],
                 )
 
-            # Process each extracted entity -> create file-to-entity mention
             with file["analysis"]["entities"].row() as entity:
                 file_entity_mentions.collect(
                     id=cocoindex.GeneratedField.UUID,
@@ -313,9 +321,7 @@ def knowledge_graph_flow_def(config: RepoConfig):
                     entity_description=entity["description"],
                 )
 
-        # ------ Neo4j exports ------
-
-        # Export File nodes
+        # Neo4j exports
         file_nodes.export(
             "file_node",
             cocoindex.targets.Neo4j(
@@ -325,7 +331,6 @@ def knowledge_graph_flow_def(config: RepoConfig):
             primary_key_fields=["filename"],
         )
 
-        # Declare Entity nodes (will be referenced by relationships)
         flow_builder.declare(
             cocoindex.targets.Neo4jDeclaration(
                 connection=neo4j_conn,
@@ -334,7 +339,6 @@ def knowledge_graph_flow_def(config: RepoConfig):
             )
         )
 
-        # Export entity-to-entity relationships
         entity_relationships.export(
             "entity_relationship",
             cocoindex.targets.Neo4j(
@@ -362,7 +366,6 @@ def knowledge_graph_flow_def(config: RepoConfig):
             primary_key_fields=["id"],
         )
 
-        # Export file -> entity DEFINES relationships
         file_entity_mentions.export(
             "file_defines_entity",
             cocoindex.targets.Neo4j(
@@ -405,75 +408,96 @@ def connection_pool() -> ConnectionPool:
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Helpers
 # ---------------------------------------------------------------------------
 
-TOP_K = 5
 
-
-def parse_args() -> argparse.Namespace:
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="CocoIndex Codebase Knowledge Graph",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  python main.py search --repository ~/_/ring\n"
-            "  python main.py search --repository ~/projects/my-app --top-k 10\n"
-        ),
-    )
-    subparsers = parser.add_subparsers(dest="command")
-
-    # search subcommand
-    search_parser = subparsers.add_parser("search", help="Interactive semantic search")
-    search_parser.add_argument(
-        "--repository",
-        "-r",
-        required=True,
-        help="Path to the repository to search",
-    )
-    search_parser.add_argument(
-        "--top-k",
-        "-k",
-        type=int,
-        default=TOP_K,
-        help=f"Number of results to return (default: {TOP_K})",
-    )
-
-    return parser.parse_args()
-
-
-def get_repo_config(repo_path: str) -> RepoConfig:
+def get_repo_config(repo_path: str, llm: str = "anthropic") -> RepoConfig:
     """Create a RepoConfig from a repository path, expanding ~ and resolving."""
     expanded = os.path.expanduser(repo_path)
     resolved = os.path.realpath(expanded)
     if not os.path.isdir(resolved):
         print(f"Error: repository path does not exist: {resolved}")
         sys.exit(1)
-    return RepoConfig(path=resolved)
+    if llm not in LLM_PROVIDERS:
+        print(
+            f"Error: unknown LLM provider '{llm}'. Choose from: {', '.join(LLM_PROVIDERS)}"
+        )
+        sys.exit(1)
+    # Check API key
+    env_key = LLM_PROVIDERS[llm]["env_key"]
+    if not os.environ.get(env_key):
+        print(f"Error: {env_key} environment variable is not set.")
+        print(f"  export {env_key}=your-key-here")
+        sys.exit(1)
+    return RepoConfig(path=resolved, llm_provider=llm)
 
 
-def run_search(config: RepoConfig, top_k: int) -> None:
-    """Run interactive semantic search loop."""
-    # Reuse the module-level flow if already registered, otherwise open a new one
-    global embedding_flow
-    try:
-        _ef = cocoindex.open_flow("CodeEmbedding", code_embedding_flow_def(config))
-    except KeyError:
-        # Flow already registered at module level
-        _ef = embedding_flow
-    table_name = cocoindex.utils.get_target_default_name(_ef, "code_embeddings")
+def open_flows(config: RepoConfig) -> tuple:
+    """Open both flows for a given config. Returns (embedding_flow, kg_flow)."""
+    ef = cocoindex.open_flow("CodeEmbedding", code_embedding_flow_def(config))
+    kf = cocoindex.open_flow("KnowledgeGraph", knowledge_graph_flow_def(config))
+    return ef, kf
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_index(args: argparse.Namespace) -> None:
+    """Index a repository: create embeddings + knowledge graph."""
+    config = get_repo_config(args.repository, args.llm)
+    provider = LLM_PROVIDERS[config.llm_provider]
+
+    print(f"Repository:  {config.path}")
+    print(f"LLM:         {provider['model']} ({config.llm_provider})")
+    print()
+
+    cocoindex.init()
+
+    ef, kf = open_flows(config)
+
+    # Setup backend (creates tables, constraints, etc.)
+    print("Setting up backends...")
+    ef.setup(report_to_stdout=True)
+    kf.setup(report_to_stdout=True)
+
+    # Run the update
+    print("\nIndexing...")
+    ef_stats = ef.update()
+    print(f"CodeEmbedding: {ef_stats}")
+
+    kf_stats = kf.update()
+    print(f"KnowledgeGraph: {kf_stats}")
+
+    print("\nDone! Open http://localhost:7474 to explore the graph.")
+    print("  Login: neo4j / cocoindex")
+    print("  Query: MATCH p=()-->() RETURN p LIMIT 200")
+
+
+def cmd_search(args: argparse.Namespace) -> None:
+    """Interactive semantic search."""
+    config = get_repo_config(args.repository, args.llm)
+
+    cocoindex.init()
+
+    ef = cocoindex.open_flow("CodeEmbedding", code_embedding_flow_def(config))
+    table_name = cocoindex.utils.get_target_default_name(ef, "code_embeddings")
 
     print(f"\nSearching in: {config.path}")
-    print(f"Returning top {top_k} results")
-    print("Enter a query to search, or press Enter to quit.\n")
+    print(f"Returning top {args.top_k} results")
+    print("Type a query, or press Enter to quit.\n")
 
     while True:
-        query = input("Enter search query (or Enter to quit): ")
+        try:
+            query = input("query> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
         if query.strip() == "":
             break
 
-        # Embed the query using the same model as indexing
         query_vector = code_to_embedding.eval(query)
 
         with connection_pool().connection() as conn:
@@ -486,7 +510,7 @@ def run_search(config: RepoConfig, top_k: int) -> None:
                     ORDER BY distance
                     LIMIT %s
                     """,
-                    (query_vector, top_k),
+                    (query_vector, args.top_k),
                 )
                 rows = cur.fetchall()
 
@@ -494,14 +518,13 @@ def run_search(config: RepoConfig, top_k: int) -> None:
             print("  No results found.\n")
             continue
 
-        print(f"\nSearch results ({len(rows)} matches):")
+        print(f"\n  {len(rows)} results:")
         for row in rows:
             filename, code, distance, start, end = row
             score = 1.0 - distance
             start_line = start["line"] if isinstance(start, dict) else start
             end_line = end["line"] if isinstance(end, dict) else end
             print(f"  [{score:.3f}] {filename} (L{start_line}-L{end_line})")
-            # Show first 200 chars of code, indented
             preview = code[:200].replace("\n", "\n    ")
             print(f"    {preview}")
             if len(code) > 200:
@@ -510,52 +533,74 @@ def run_search(config: RepoConfig, top_k: int) -> None:
         print()
 
 
-def _main() -> None:
-    """Main entry point."""
-    args = parse_args()
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-    if args.command == "search":
-        config = get_repo_config(args.repository)
-        cocoindex.init()
-        run_search(config, args.top_k)
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="CocoIndex Codebase Knowledge Graph",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python main.py index -r ~/_/ring\n"
+            "  python main.py index -r ~/_/ring --llm gemini\n"
+            "  python main.py search -r ~/_/ring\n"
+            "  python main.py search -r ~/_/ring --top-k 10\n"
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # --- index ---
+    idx = subparsers.add_parser(
+        "index", help="Index a repository (embeddings + knowledge graph)"
+    )
+    idx.add_argument(
+        "--repository",
+        "-r",
+        required=True,
+        help="Path to the repository to index",
+    )
+    idx.add_argument(
+        "--llm",
+        default="anthropic",
+        choices=list(LLM_PROVIDERS.keys()),
+        help="LLM provider for entity extraction (default: anthropic)",
+    )
+
+    # --- search ---
+    srch = subparsers.add_parser("search", help="Interactive semantic search")
+    srch.add_argument(
+        "--repository",
+        "-r",
+        required=True,
+        help="Path to the repository to search",
+    )
+    srch.add_argument(
+        "--llm",
+        default="anthropic",
+        choices=list(LLM_PROVIDERS.keys()),
+        help="LLM provider (must match what was used for indexing)",
+    )
+    srch.add_argument(
+        "--top-k",
+        "-k",
+        type=int,
+        default=5,
+        help="Number of results to return (default: 5)",
+    )
+
+    args = parser.parse_args()
+
+    if args.command == "index":
+        cmd_index(args)
+    elif args.command == "search":
+        cmd_search(args)
     else:
-        print("Usage:")
-        print("  # Set the repo path, then index:")
-        print("  export COCOINDEX_REPO_PATH=/path/to/repo")
-        print("  cocoindex update main")
-        print()
-        print("  # Semantic search:")
-        print("  python main.py search --repository /path/to/repo")
-        print()
-        print("  # CocoInsight pipeline visualization:")
-        print("  export COCOINDEX_REPO_PATH=/path/to/repo")
-        print("  cocoindex server -ci main")
+        parser.print_help()
         sys.exit(1)
 
 
-# ---------------------------------------------------------------------------
-# Module-level flow registration for `cocoindex update` and `cocoindex server`
-#
-# When cocoindex CLI runs (e.g. `cocoindex update main`), it imports this module
-# and looks for flows. We read COCOINDEX_REPO_PATH from the environment.
-# ---------------------------------------------------------------------------
-
-# Load .env early so COCOINDEX_REPO_PATH can be set there too
-load_dotenv()
-
-_repo_path = os.environ.get("COCOINDEX_REPO_PATH")
-
-if _repo_path is not None:
-    _config = get_repo_config(_repo_path)
-
-    # Register both flows with cocoindex
-    embedding_flow = cocoindex.open_flow(
-        "CodeEmbedding", code_embedding_flow_def(_config)
-    )
-    knowledge_graph_flow = cocoindex.open_flow(
-        "KnowledgeGraph", knowledge_graph_flow_def(_config)
-    )
-
-
 if __name__ == "__main__":
-    _main()
+    main()
