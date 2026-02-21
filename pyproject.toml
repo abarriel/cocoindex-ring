@@ -1,0 +1,15 @@
+[project]
+name = "cocoindex-ring"
+version = "0.1.0"
+description = "Index any codebase into a knowledge graph with CocoIndex. Supports semantic search and Neo4j visualization."
+requires-python = ">=3.11"
+dependencies = [
+    "cocoindex[embeddings]>=0.3.9",
+    "python-dotenv>=1.0.1",
+    "pgvector>=0.4.1",
+    "psycopg[binary,pool]",
+    "numpy",
+]
+
+[tool.setuptools]
+packages = []
