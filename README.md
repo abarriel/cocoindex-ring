@@ -2,6 +2,19 @@
 
 Index any codebase into a **Neo4j knowledge graph** with **semantic search**, powered by [CocoIndex](https://github.com/cocoindex-io/cocoindex).
 
+## What it does
+
+Given a path to any repository, this tool:
+
+1. **Scans** all source files (TS, Python, Rust, C/C++, Java, etc.)
+2. **Chunks** code using Tree-sitter (language-aware splitting)
+3. **Embeds** chunks locally with SentenceTransformer (free, no API key)
+4. **Extracts entities & relationships** using an LLM via `ExtractByLlm` — in a single pass, produces:
+   - **Graph data**: entities (functions, components, schemas...) and relationships (imports, calls, depends on...)
+   - **Per-file summaries**: business logic description, dependencies, key architectural decisions
+5. **Exports** to Neo4j (knowledge graph) + Postgres (vector embeddings)
+6. **Enables** visual graph exploration in Neo4j Browser + semantic code search
+
 ## Requirements
 
 - **Docker** (Postgres + Neo4j)
@@ -43,6 +56,10 @@ python main.py index  -r /path/to/repo --llm gemini
 # Search
 python main.py search -r /path/to/repo
 python main.py search -r /path/to/repo --top-k 10
+
+# Explain — generate a .md file per source file
+python main.py explain -r /path/to/repo
+python main.py explain -r /path/to/repo -o ./docs --llm gemini
 ```
 
 | Command | Flag | Short | Default | Description |
@@ -51,6 +68,9 @@ python main.py search -r /path/to/repo --top-k 10
 | `index` | `--llm` | | `anthropic` | LLM provider: `anthropic` or `gemini` |
 | `search` | `--repository` | `-r` | required | Path to the repository |
 | `search` | `--top-k` | `-k` | `5` | Number of results |
+| `explain` | `--repository` | `-r` | required | Path to the repository |
+| `explain` | `--output` | `-o` | `./docs` | Output directory for markdown files |
+| `explain` | `--llm` | | `anthropic` | LLM provider: `anthropic` or `gemini` |
 
 ## Configuration
 
@@ -107,6 +127,42 @@ query> swipe deck UI
   [0.350] src/components/swipe-deck.tsx (L1-L90)
     Swipeable card component with gesture handling...
 ```
+
+### Explain — per-file markdown docs
+
+```bash
+$ python main.py explain -r ~/my-project -o ./docs
+
+Repository:  /Users/you/my-project
+LLM:         claude-sonnet-4-20250514 (anthropic)
+Output:      /Users/you/cocoindex-ring/docs
+
+Setting up...
+Generating explanations...
+Done! Markdown files written to: /Users/you/cocoindex-ring/docs
+```
+
+Output mirrors the repo structure:
+
+```
+docs/
+  apps/
+    api/
+      src/
+        router.ts.md
+        middleware.ts.md
+    mobile/
+      src/
+        App.tsx.md
+        components/
+          swipe-deck.tsx.md
+  packages/
+    shared/
+      src/
+        index.ts.md
+```
+
+Each `.md` file contains: purpose, key concepts, code walkthrough, dependencies, and usage.
 
 ### Neo4j queries
 

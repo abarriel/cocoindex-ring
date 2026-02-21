@@ -8,16 +8,19 @@ Usage:
     python main.py index --repository /path/to/repo --llm gemini
     python main.py search --repository /path/to/repo
     python main.py search --repository /path/to/repo --top-k 10
+    python main.py explain --repository /path/to/repo --output ./docs
 """
 
 import argparse
 import functools
 import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 
 import cocoindex
 import numpy as np
+from cocoindex.op import TargetSpec, target_connector
 from dotenv import load_dotenv
 from numpy.typing import NDArray
 from pgvector.psycopg import register_vector
@@ -160,6 +163,121 @@ class FileAnalysis:
     """All entities defined in this file."""
     relationships: list[Relationship]
     """All relationships between entities in or referenced by this file."""
+
+
+@dataclass
+class FileExplanation:
+    """Detailed markdown explanation of a source file."""
+
+    purpose: str
+    """What this file does and why it exists. 2-3 sentences of business context."""
+    key_concepts: str
+    """Bullet-point list of the main concepts, patterns, or architectural decisions in the file."""
+    code_walkthrough: str
+    """A section-by-section walkthrough of the code. Explain each important function, class, or block.
+    Use markdown headers (###) for each section. Include relevant code snippets in fenced code blocks."""
+    dependencies: str
+    """What this file imports/depends on and why. Bullet-point list."""
+    usage: str
+    """How this file is used by other parts of the codebase. Where it's imported, called, or referenced."""
+
+
+# ---------------------------------------------------------------------------
+# Custom target: write .md files to local directory
+# ---------------------------------------------------------------------------
+
+
+class MarkdownFileTarget(TargetSpec):
+    """Target that writes markdown files to a local directory, preserving structure."""
+
+    directory: str
+
+
+@dataclass
+class MarkdownFileValues:
+    """Values written to each markdown file."""
+
+    markdown: str
+
+
+@target_connector(
+    spec_cls=MarkdownFileTarget,
+    persistent_key_type=str,
+    setup_state_cls=MarkdownFileTarget,
+)
+class MarkdownFileTargetConnector:
+    @staticmethod
+    def get_persistent_key(spec: MarkdownFileTarget, target_name: str) -> str:
+        return spec.directory
+
+    @staticmethod
+    def describe(key: str) -> str:
+        return f"Markdown directory {key}"
+
+    @staticmethod
+    def apply_setup_change(
+        key: str,
+        previous: MarkdownFileTarget | None,
+        current: MarkdownFileTarget | None,
+    ) -> None:
+        if previous is None and current is not None:
+            os.makedirs(current.directory, exist_ok=True)
+        if previous is not None and current is None:
+            if os.path.isdir(previous.directory):
+                shutil.rmtree(previous.directory, ignore_errors=True)
+
+    @staticmethod
+    def prepare(spec: MarkdownFileTarget) -> MarkdownFileTarget:
+        return spec
+
+    @staticmethod
+    def mutate(
+        *all_mutations: tuple[MarkdownFileTarget, dict[str, MarkdownFileValues | None]],
+    ) -> None:
+        for spec, mutations in all_mutations:
+            for filename, mutation in mutations.items():
+                full_path = os.path.join(spec.directory, filename) + ".md"
+                if mutation is None:
+                    try:
+                        os.remove(full_path)
+                    except FileNotFoundError:
+                        pass
+                else:
+                    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                    with open(full_path, "w") as f:
+                        f.write(mutation.markdown)
+
+
+# ---------------------------------------------------------------------------
+# Custom function: format FileExplanation into markdown
+# ---------------------------------------------------------------------------
+
+
+@cocoindex.op.function()
+def format_explanation(filename: str, explanation: FileExplanation) -> str:
+    """Format a FileExplanation dataclass into a full markdown document."""
+    return f"""# `{filename}`
+
+## Purpose
+
+{explanation.purpose}
+
+## Key Concepts
+
+{explanation.key_concepts}
+
+## Code Walkthrough
+
+{explanation.code_walkthrough}
+
+## Dependencies
+
+{explanation.dependencies}
+
+## Usage
+
+{explanation.usage}
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +515,74 @@ def knowledge_graph_flow_def(config: RepoConfig):
 
 
 # ---------------------------------------------------------------------------
+# Flow 3: Explain (scan -> LLM explain -> write .md files)
+# ---------------------------------------------------------------------------
+
+
+def explain_flow_def(config: RepoConfig, output_dir: str):
+    """Create a parameterized flow definition for generating markdown explanations."""
+
+    provider = LLM_PROVIDERS[config.llm_provider]
+
+    def _flow_def(
+        flow_builder: cocoindex.FlowBuilder, data_scope: cocoindex.DataScope
+    ) -> None:
+        data_scope["files"] = flow_builder.add_source(
+            cocoindex.sources.LocalFile(
+                path=config.path,
+                included_patterns=config.included_patterns,
+                excluded_patterns=config.excluded_patterns,
+            )
+        )
+
+        md_output = data_scope.add_collector()
+
+        with data_scope["files"].row() as file:
+            file["explanation"] = file["content"].transform(
+                cocoindex.functions.ExtractByLlm(
+                    llm_spec=cocoindex.LlmSpec(
+                        api_type=provider["api_type"],
+                        model=provider["model"],
+                    ),
+                    output_type=FileExplanation,
+                    instruction=(
+                        "You are a senior engineer writing documentation for a codebase.\n"
+                        "Analyze this source code file and produce a detailed explanation.\n\n"
+                        "For each field:\n"
+                        "- purpose: What this file does and why it exists. 2-3 sentences.\n"
+                        "- key_concepts: Bullet-point list (use - prefix) of main concepts, "
+                        "patterns, or architectural decisions.\n"
+                        "- code_walkthrough: Section-by-section explanation of the code. "
+                        "Use ### headers for each function/class/block. Include short code "
+                        "snippets in fenced code blocks (```lang) to illustrate key points.\n"
+                        "- dependencies: Bullet-point list of imports and why each is needed.\n"
+                        "- usage: How other files use this file. If unknown, describe the "
+                        "likely consumers based on what it exports.\n\n"
+                        "Write in clear, concise technical prose. Focus on the WHY, not just the WHAT."
+                    ),
+                ),
+            )
+
+            file["markdown"] = file["filename"].transform(
+                format_explanation,
+                explanation=file["explanation"],
+            )
+
+            md_output.collect(
+                filename=file["filename"],
+                markdown=file["markdown"],
+            )
+
+        md_output.export(
+            "markdown_docs",
+            MarkdownFileTarget(directory=output_dir),
+            primary_key_fields=["filename"],
+        )
+
+    return _flow_def
+
+
+# ---------------------------------------------------------------------------
 # Postgres connection pool for search queries
 # ---------------------------------------------------------------------------
 
@@ -533,6 +719,31 @@ def cmd_search(args: argparse.Namespace) -> None:
         print()
 
 
+def cmd_explain(args: argparse.Namespace) -> None:
+    """Generate markdown explanations for each file in a repository."""
+    config = get_repo_config(args.repository, args.llm)
+    provider = LLM_PROVIDERS[config.llm_provider]
+    output_dir = os.path.realpath(os.path.expanduser(args.output))
+
+    print(f"Repository:  {config.path}")
+    print(f"LLM:         {provider['model']} ({config.llm_provider})")
+    print(f"Output:      {output_dir}")
+    print()
+
+    cocoindex.init()
+
+    flow = cocoindex.open_flow("ExplainDocs", explain_flow_def(config, output_dir))
+
+    print("Setting up...")
+    flow.setup(report_to_stdout=True)
+
+    print("\nGenerating explanations...")
+    stats = flow.update()
+    print(f"ExplainDocs: {stats}")
+
+    print(f"\nDone! Markdown files written to: {output_dir}")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -548,6 +759,7 @@ def main() -> None:
             "  python main.py index -r ~/_/ring --llm gemini\n"
             "  python main.py search -r ~/_/ring\n"
             "  python main.py search -r ~/_/ring --top-k 10\n"
+            "  python main.py explain -r ~/_/ring -o ./docs\n"
         ),
     )
     subparsers = parser.add_subparsers(dest="command")
@@ -591,12 +803,37 @@ def main() -> None:
         help="Number of results to return (default: 5)",
     )
 
+    # --- explain ---
+    exp = subparsers.add_parser(
+        "explain", help="Generate markdown explanation per file"
+    )
+    exp.add_argument(
+        "--repository",
+        "-r",
+        required=True,
+        help="Path to the repository to explain",
+    )
+    exp.add_argument(
+        "--llm",
+        default="anthropic",
+        choices=list(LLM_PROVIDERS.keys()),
+        help="LLM provider (default: anthropic)",
+    )
+    exp.add_argument(
+        "--output",
+        "-o",
+        default="./docs",
+        help="Output directory for markdown files (default: ./docs)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "index":
         cmd_index(args)
     elif args.command == "search":
         cmd_search(args)
+    elif args.command == "explain":
+        cmd_explain(args)
     else:
         parser.print_help()
         sys.exit(1)
